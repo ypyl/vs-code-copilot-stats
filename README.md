@@ -1,0 +1,167 @@
+# VS Code Copilot Stats
+
+Track GitHub Copilot usage and costs from VS Code's built-in OpenTelemetry exporter. Zero cloud dependencies — everything runs locally.
+
+## How it works
+
+```
+  VS Code                    Your machine                   Output
+  ───────                    ────────────                   ──────
+  Copilot Chat ──▶ SQLite DB ──▶ Export .db ──▶ copilot-stats.ps1 ──▶ JSON report
+  (auto)           (internal)     (one click)     (this tool)          with costs
+```
+
+1. **`setup-otel.ps1`** — enables Copilot's built-in OTel SQLite exporter (one-time)
+2. Use Copilot normally
+3. **Ctrl+Shift+P → "Chat: Export Agent Traces DB"** — saves a `.db` file
+4. **`copilot-stats.ps1`** — queries the DB and produces usage/cost reports
+
+## Quick start
+
+```powershell
+# 1. Enable OTel (one-time)
+.\setup-otel.ps1
+
+# 2. Use Copilot, then export the DB
+#    Ctrl+Shift+P → type "Export Agent Traces" → save .db file
+
+# 3. Get stats
+.\copilot-stats.ps1 -DbPath agent-traces.db -Daily
+.\copilot-stats.ps1 -DbPath agent-traces.db -Sessions
+.\copilot-stats.ps1 -DbPath agent-traces.db -Cost
+```
+
+## Commands
+
+### `setup-otel.ps1`
+
+Enables the Copilot SQLite span exporter in VS Code settings. Cleans up any stale file-exporter settings from prior setups.
+
+```powershell
+.\setup-otel.ps1
+.\setup-otel.ps1 -SettingsPath "C:\custom\settings.json"
+```
+
+### `copilot-stats.ps1`
+
+Queries an exported `.db` file and produces JSON reports.
+
+```powershell
+# Per-session breakdown (token counts, model, duration, cost per session)
+.\copilot-stats.ps1 -DbPath agent-traces.db -Sessions
+
+# Daily aggregation (default mode)
+.\copilot-stats.ps1 -DbPath agent-traces.db -Daily
+
+# Weekly / Monthly aggregation
+.\copilot-stats.ps1 -DbPath agent-traces.db -Weekly
+.\copilot-stats.ps1 -DbPath agent-traces.db -Monthly
+
+# Filter to a specific period
+.\copilot-stats.ps1 -DbPath agent-traces.db -Daily -Period "2026-06-06"
+.\copilot-stats.ps1 -DbPath agent-traces.db -Weekly -Period "2026-W23"
+.\copilot-stats.ps1 -DbPath agent-traces.db -Monthly -Period "2026-06"
+
+# Cost breakdown by model
+.\copilot-stats.ps1 -DbPath agent-traces.db -Cost
+
+# Save report to file
+.\copilot-stats.ps1 -DbPath agent-traces.db -Daily -OutputFile report.json
+```
+
+## Example output
+
+### Sessions mode
+```json
+{
+  "report_type": "sessions",
+  "data": [
+    {
+      "date": "2026-06-06",
+      "model": "raptor-mini",
+      "input_tokens": 50550,
+      "output_tokens": 859,
+      "duration_sec": 18.0,
+      "turns": 2,
+      "cost_usd": 0.015,
+      "cost_credits": 1.50
+    }
+  ]
+}
+```
+
+### Cost mode
+```json
+{
+  "report_type": "cost",
+  "data": [
+    {
+      "model": "raptor-mini",
+      "calls": 23,
+      "input_tokens": 1119304,
+      "output_tokens": 16609,
+      "cost_usd": 0.3384,
+      "cost_credits": 33.84
+    }
+  ],
+  "totals": {
+    "input_tokens": 1119304,
+    "output_tokens": 16609,
+    "cost_usd": 0.3384,
+    "cost_credits": 33.84
+  }
+}
+```
+
+## What gets tracked
+
+| Metric | Source |
+|--------|--------|
+| Token usage (input/output/cache) | `invoke_agent` and `chat` spans |
+| Models used | `gen_ai.request.model` |
+| Sessions per day/week/month | `invoke_agent` spans grouped by date |
+| Turn count per session | `copilot_chat.turn_count` attribute |
+| Agent duration | `start_time_ms` → `end_time_ms` |
+| Tool calls | `execute_tool` spans |
+| Estimated cost | Calculated from `model-pricing.json` |
+
+## What gets filtered out
+
+Copilot runs internal operations that aren't billed to you. These are automatically excluded:
+
+- **Session naming** (`title`)
+- **Progress messages** (`progressMessages`)
+- **Context summarization** (`summarizeVirtualTools`)
+- **Semantic search embeddings** (`text-embedding-3-small-512`)
+- **Internal model calls** (`gpt-4o-mini-2024-07-18`)
+
+## Pricing model
+
+`model-pricing.json` contains per-million-token rates for all GitHub Copilot models across 5 providers (OpenAI, Anthropic, Google, GitHub fine-tuned, Microsoft). 1 AI credit = $0.01 USD.
+
+When GitHub updates pricing, edit this file. To map a new OTel model ID to a pricing entry, add it to the `aliases` section:
+
+```json
+{
+  "aliases": {
+    "oswe-vscode-prime": "raptor-mini",
+    "some-new-model-id": "gpt-5.4-mini"
+  }
+}
+```
+
+## Requirements
+
+- Windows with PowerShell 5.1+
+- Python 3 with `sqlite3` (standard library, no pip install needed)
+- VS Code with Copilot Chat extension
+
+## Files
+
+```
+copilot-stats/
+├── README.md
+├── setup-otel.ps1           Enable OTel SQLite exporter in VS Code
+├── copilot-stats.ps1         Query exported DB, produce usage/cost reports
+└── model-pricing.json        Rate card for all GitHub Copilot models
+```
