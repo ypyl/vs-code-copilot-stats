@@ -322,16 +322,31 @@ ORDER BY s.start_time_ms
     $sessionData = @()
     foreach ($span in $agentSpans) {
         $sid = $span.span_id
-        $attrSql = "SELECT key, value FROM span_attributes WHERE span_id = '$sid' AND key IN ('gen_ai.usage.input_tokens', 'gen_ai.usage.output_tokens', 'gen_ai.usage.cache_read.input_tokens')"
+        $attrSql = "SELECT key, value FROM span_attributes WHERE span_id = '$sid' AND key IN ('gen_ai.usage.input_tokens', 'gen_ai.usage.output_tokens', 'gen_ai.usage.cache_read.input_tokens', 'copilot_chat.user_request')"
         $attrs = Invoke-SqliteQuery -Sql $attrSql -Db $resolvedDbPath
 
         $inputTokens = 0; $outputTokens = 0; $cacheTokens = 0
+        $userRequest = ""
         if ($attrs) {
             foreach ($a in $attrs) {
                 switch ($a.key) {
                     'gen_ai.usage.input_tokens'           { $inputTokens = [int]$a.value }
                     'gen_ai.usage.output_tokens'          { $outputTokens = [int]$a.value }
                     'gen_ai.usage.cache_read.input_tokens' { $cacheTokens = [int]$a.value }
+                    'copilot_chat.user_request'           { $userRequest = $a.value }
+                }
+            }
+        }
+
+        # Build session summary from first line of user request
+        $summary = "(no summary)"
+        if ($userRequest) {
+            $firstLine = ($userRequest -split '\n')[0].Trim()
+            if ($firstLine.Length -gt 0) {
+                if ($firstLine.Length -gt 120) {
+                    $summary = $firstLine.Substring(0, 120) + "..."
+                } else {
+                    $summary = $firstLine
                 }
             }
         }
@@ -357,6 +372,7 @@ ORDER BY s.start_time_ms
             cost_usd        = if ($c) { $c.usd } else { $null }
             cost_credits    = if ($c) { $c.credits } else { $null }
             conversation_id = $span.conversation_id
+            session_summary = $summary
         }
     }
     $report.data = $sessionData
