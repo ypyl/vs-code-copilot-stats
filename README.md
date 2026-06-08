@@ -81,6 +81,8 @@ Queries an exported `.db` file and produces JSON reports.
       "model": "raptor-mini",
       "input_tokens": 50550,
       "output_tokens": 859,
+      "cache_tokens": 38000,
+      "cache_write_tokens": 0,
       "duration_sec": 18.0,
       "turns": 2,
       "cost_usd": 0.015,
@@ -100,6 +102,8 @@ Queries an exported `.db` file and produces JSON reports.
       "calls": 23,
       "input_tokens": 1119304,
       "output_tokens": 16609,
+      "cache_tokens": 450000,
+      "cache_write_tokens": 0,
       "cost_usd": 0.3384,
       "cost_credits": 33.84
     }
@@ -107,6 +111,8 @@ Queries an exported `.db` file and produces JSON reports.
   "totals": {
     "input_tokens": 1119304,
     "output_tokens": 16609,
+    "cache_tokens": 450000,
+    "cache_write_tokens": 0,
     "cost_usd": 0.3384,
     "cost_credits": 33.84
   }
@@ -117,7 +123,7 @@ Queries an exported `.db` file and produces JSON reports.
 
 | Metric | Source |
 |--------|--------|
-| Token usage (input/output/cache) | `invoke_agent` and `chat` spans |
+| Token usage (input/output/cache/cache_write) | `invoke_agent` and `chat` spans |
 | Models used | `gen_ai.request.model` |
 | Sessions per day/week/month | `invoke_agent` spans grouped by date |
 | Turn count per session | `copilot_chat.turn_count` attribute |
@@ -138,6 +144,30 @@ Copilot runs internal operations that aren't billed to you. These are automatica
 ## Pricing model
 
 `model-pricing.json` contains per-million-token rates for all GitHub Copilot models across 5 providers (OpenAI, Anthropic, Google, GitHub fine-tuned, Microsoft). 1 AI credit = $0.01 USD.
+
+### Cost calculation
+
+Cached input tokens are a **subset** of total input tokens, not additional. The cost formula is:
+
+```
+uncached_input = total_input - cached_input
+cost = (uncached_input × input_rate + cached_input × cache_input_rate + output × output_rate + cache_write × cache_write_rate) / 1,000,000
+```
+
+Cache write tokens (Anthropic models only) are priced at the `cache_write` rate when present.
+
+### Tiered pricing
+
+GPT-5.4 and GPT-5.5 use tiered pricing based on input token count per request:
+
+| Model | Tier | Threshold | Input | Cached Input | Output |
+|-------|------|-----------|-------|-------------|--------|
+| GPT-5.4 | Default | ≤ 272K | $2.50 | $0.25 | $15.00 |
+| GPT-5.4 | Long context | > 272K | $5.00 | $0.50 | $22.50 |
+| GPT-5.5 | Default | ≤ 272K | $5.00 | $0.50 | $30.00 |
+| GPT-5.5 | Long context | > 272K | $10.00 | $1.00 | $45.00 |
+
+Tiers are defined as an array of `{ threshold, input, cache_input, output }` objects in `model-pricing.json`. The tool selects the first tier where the request's input tokens ≤ threshold.
 
 When GitHub updates pricing, edit this file. To map a new OTel model ID to a pricing entry, add it to the `aliases` section:
 

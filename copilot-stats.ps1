@@ -223,7 +223,7 @@ if ($pricing) {
 # Pricing lookup helper
 # ============================================================
 function Get-PriceInfo {
-    param([string]$OtelModelId)
+    param([string]$OtelModelId, [int]$InputTokens = 0)
 
     if (-not $pricing) { return $null }
 
@@ -237,28 +237,56 @@ function Get-PriceInfo {
         $pricingKey = $aliasVal
     }
 
-    if ($pricing.models.PSObject.Properties[$pricingKey]) {
-        return $pricing.models.PSObject.Properties[$pricingKey].Value
+    if (-not $pricing.models.PSObject.Properties[$pricingKey]) {
+        return $null
     }
-    return $null
+
+    $modelPricing = $pricing.models.PSObject.Properties[$pricingKey].Value
+
+    # Check for tiered pricing
+    if ($modelPricing.PSObject.Properties['tiers']) {
+        $tiers = @($modelPricing.tiers | Sort-Object { [int]$_.threshold })
+        foreach ($tier in $tiers) {
+            if ($InputTokens -le [int]$tier.threshold) {
+                return $tier
+            }
+        }
+        # Fallback: return last tier if none matched
+        return $tiers[-1]
+    }
+
+    # Flat pricing (backward compatible)
+    return $modelPricing
 }
 
 function Get-Cost {
-    param($Pricing, $InTokens, $OutTokens, $CacheTok)
+    param($Pricing, $InTokens, $OutTokens, $CacheTok, $CacheWriteTok)
 
     if (-not $Pricing) { return $null }
 
     $tokensIn = [double]$InTokens
     $tokensOut = [double]$OutTokens
     $tokensCache = [double]$CacheTok
+    $tokensCacheWrite = [double]$CacheWriteTok
 
-    $inCost = $tokensIn / 1000000.0 * [double]$Pricing.input
+    # Clamp cache to input (cache is a subset, not additive)
+    $effectiveCache = [math]::Min($tokensCache, $tokensIn)
+    $uncachedInput = $tokensIn - $effectiveCache
+
+    $inCost = $uncachedInput / 1000000.0 * [double]$Pricing.input
     $outCost = $tokensOut / 1000000.0 * [double]$Pricing.output
+
     $cacheCost = 0.0
-    if ($Pricing.cache_input -and $CacheTok) {
-        $cacheCost = $tokensCache / 1000000.0 * [double]$Pricing.cache_input
+    if ($Pricing.cache_input -and $effectiveCache -gt 0) {
+        $cacheCost = $effectiveCache / 1000000.0 * [double]$Pricing.cache_input
     }
-    $totalUsd = $inCost + $outCost + $cacheCost
+
+    $cacheWriteCost = 0.0
+    if ($Pricing.cache_write -and $tokensCacheWrite -gt 0) {
+        $cacheWriteCost = $tokensCacheWrite / 1000000.0 * [double]$Pricing.cache_write
+    }
+
+    $totalUsd = $inCost + $outCost + $cacheCost + $cacheWriteCost
     $rate = [double]$script:pricing.credit_usd_rate
     $totalCredits = if ($rate -gt 0) { $totalUsd / $rate } else { 0.0 }
 
@@ -322,18 +350,19 @@ ORDER BY s.start_time_ms
     $sessionData = @()
     foreach ($span in $agentSpans) {
         $sid = $span.span_id
-        $attrSql = "SELECT key, value FROM span_attributes WHERE span_id = '$sid' AND key IN ('gen_ai.usage.input_tokens', 'gen_ai.usage.output_tokens', 'gen_ai.usage.cache_read.input_tokens', 'copilot_chat.user_request')"
+        $attrSql = "SELECT key, value FROM span_attributes WHERE span_id = '$sid' AND key IN ('gen_ai.usage.input_tokens', 'gen_ai.usage.output_tokens', 'gen_ai.usage.cache_read.input_tokens', 'gen_ai.usage.cache_creation.input_tokens', 'copilot_chat.user_request')"
         $attrs = Invoke-SqliteQuery -Sql $attrSql -Db $resolvedDbPath
 
-        $inputTokens = 0; $outputTokens = 0; $cacheTokens = 0
+        $inputTokens = 0; $outputTokens = 0; $cacheTokens = 0; $cacheWriteTokens = 0
         $userRequest = ""
         if ($attrs) {
             foreach ($a in $attrs) {
                 switch ($a.key) {
-                    'gen_ai.usage.input_tokens'           { $inputTokens = [int]$a.value }
-                    'gen_ai.usage.output_tokens'          { $outputTokens = [int]$a.value }
-                    'gen_ai.usage.cache_read.input_tokens' { $cacheTokens = [int]$a.value }
-                    'copilot_chat.user_request'           { $userRequest = $a.value }
+                    'gen_ai.usage.input_tokens'            { $inputTokens = [int]$a.value }
+                    'gen_ai.usage.output_tokens'           { $outputTokens = [int]$a.value }
+                    'gen_ai.usage.cache_read.input_tokens'  { $cacheTokens = [int]$a.value }
+                    'gen_ai.usage.cache_creation.input_tokens' { $cacheWriteTokens = [int]$a.value }
+                    'copilot_chat.user_request'            { $userRequest = $a.value }
                 }
             }
         }
@@ -352,8 +381,8 @@ ORDER BY s.start_time_ms
         }
 
         $modelName = Format-ModelName -OtelId $span.request_model
-        $priceInfo = Get-PriceInfo -OtelModelId $span.request_model
-        $c = Get-Cost -Pricing $priceInfo -InTokens $inputTokens -OutTokens $outputTokens -CacheTok $cacheTokens
+        $priceInfo = Get-PriceInfo -OtelModelId $span.request_model -InputTokens $inputTokens
+        $c = Get-Cost -Pricing $priceInfo -InTokens $inputTokens -OutTokens $outputTokens -CacheTok $cacheTokens -CacheWriteTok $cacheWriteTokens
         $durationSec = if ($span.end_time_ms -and $span.start_time_ms) { [math]::Round(([double]$span.end_time_ms - [double]$span.start_time_ms) / 1000.0, 1) } else { 0 }
 
         $ts = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$span.start_time_ms)
@@ -369,6 +398,7 @@ ORDER BY s.start_time_ms
             input_tokens    = $inputTokens
             output_tokens   = $outputTokens
             cache_tokens    = $cacheTokens
+            cache_write_tokens = $cacheWriteTokens
             cost_usd        = if ($c) { $c.usd } else { $null }
             cost_credits    = if ($c) { $c.credits } else { $null }
             conversation_id = $span.conversation_id
@@ -378,120 +408,236 @@ ORDER BY s.start_time_ms
     $report.data = $sessionData
 }
 elseif ($Cost) {
-    # Cost breakdown by model — aggregate chat spans
+    # Cost breakdown by model — per-span processing with span_attributes
     $sql = @"
-SELECT
-    request_model,
-    SUM(COALESCE(input_tokens, 0)) AS total_input,
-    SUM(COALESCE(output_tokens, 0)) AS total_output,
-    SUM(COALESCE(cached_tokens, 0)) AS total_cache,
-    COUNT(*) AS call_count
+SELECT span_id, request_model
 FROM spans
 $filterClause
   AND name LIKE 'chat%'
-GROUP BY request_model
-ORDER BY total_input DESC
 "@
-    $modelRows = Invoke-SqliteQuery -Sql $sql -Db $resolvedDbPath
-    if (-not $modelRows) { $modelRows = @() }
+    $chatSpans = Invoke-SqliteQuery -Sql $sql -Db $resolvedDbPath
+    if (-not $chatSpans) { $chatSpans = @() }
+
+    # Aggregate per-span costs by model
+    $modelAgg = @{}
+    foreach ($span in $chatSpans) {
+        $sid = $span.span_id
+        $attrSql = "SELECT key, value FROM span_attributes WHERE span_id = '$sid' AND key IN ('gen_ai.usage.input_tokens', 'gen_ai.usage.output_tokens', 'gen_ai.usage.cache_read.input_tokens', 'gen_ai.usage.cache_creation.input_tokens')"
+        $attrs = Invoke-SqliteQuery -Sql $attrSql -Db $resolvedDbPath
+
+        $inputTokens = 0; $outputTokens = 0; $cacheTokens = 0; $cacheWriteTokens = 0
+        if ($attrs) {
+            foreach ($a in $attrs) {
+                switch ($a.key) {
+                    'gen_ai.usage.input_tokens'            { $inputTokens = [int]$a.value }
+                    'gen_ai.usage.output_tokens'           { $outputTokens = [int]$a.value }
+                    'gen_ai.usage.cache_read.input_tokens'  { $cacheTokens = [int]$a.value }
+                    'gen_ai.usage.cache_creation.input_tokens' { $cacheWriteTokens = [int]$a.value }
+                }
+            }
+        }
+
+        $modelKey = $span.request_model
+        if (-not $modelAgg.ContainsKey($modelKey)) {
+            $modelAgg[$modelKey] = @{
+                calls        = 0
+                input        = 0
+                output       = 0
+                cache        = 0
+                cache_write  = 0
+                cost_usd     = 0.0
+                cost_credits = 0.0
+            }
+        }
+        $agg = $modelAgg[$modelKey]
+        $agg.calls++
+        $agg.input += $inputTokens
+        $agg.output += $outputTokens
+        $agg.cache += $cacheTokens
+        $agg.cache_write += $cacheWriteTokens
+
+        $priceInfo = Get-PriceInfo -OtelModelId $span.request_model -InputTokens $inputTokens
+        $c = Get-Cost -Pricing $priceInfo -InTokens $inputTokens -OutTokens $outputTokens -CacheTok $cacheTokens -CacheWriteTok $cacheWriteTokens
+        if ($c) { $agg.cost_usd += $c.usd; $agg.cost_credits += $c.credits }
+    }
 
     $costData = @()
-    $grandInput = 0; $grandOutput = 0; $grandCache = 0; $grandUsd = 0.0; $grandCredits = 0.0
-    foreach ($r in $modelRows) {
-        $modelName = Format-ModelName -OtelId $r.request_model
-        $priceInfo = Get-PriceInfo -OtelModelId $r.request_model
-        $c = Get-Cost -Pricing $priceInfo -InTokens $r.total_input -OutTokens $r.total_output -CacheTok $r.total_cache
+    $grandInput = 0; $grandOutput = 0; $grandCache = 0; $grandCacheWrite = 0; $grandUsd = 0.0; $grandCredits = 0.0
+    foreach ($modelKey in ($modelAgg.Keys | Sort-Object { $modelAgg[$_].input } -Descending)) {
+        $agg = $modelAgg[$modelKey]
+        $modelName = Format-ModelName -OtelId $modelKey
+        # Use Get-PriceInfo without input tokens just to check if priced
+        $priceCheck = Get-PriceInfo -OtelModelId $modelKey
 
-        $grandInput += [int]$r.total_input
-        $grandOutput += [int]$r.total_output
-        $grandCache += [int]$r.total_cache
-        if ($c) { $grandUsd += $c.usd; $grandCredits += $c.credits }
+        $grandInput += $agg.input
+        $grandOutput += $agg.output
+        $grandCache += $agg.cache
+        $grandCacheWrite += $agg.cache_write
+        $grandUsd += $agg.cost_usd
+        $grandCredits += $agg.cost_credits
 
         $costData += [ordered]@{
-            model        = $modelName
-            model_raw    = $r.request_model
-            calls        = [int]$r.call_count
-            input_tokens = [int]$r.total_input
-            output_tokens = [int]$r.total_output
-            cache_tokens = [int]$r.total_cache
-            cost_usd     = if ($c) { $c.usd } else { $null }
-            cost_credits = if ($c) { $c.credits } else { $null }
-            priced       = ($priceInfo -ne $null)
+            model              = $modelName
+            model_raw          = $modelKey
+            calls              = $agg.calls
+            input_tokens       = $agg.input
+            output_tokens      = $agg.output
+            cache_tokens       = $agg.cache
+            cache_write_tokens = $agg.cache_write
+            cost_usd           = [math]::Round($agg.cost_usd, 4)
+            cost_credits       = [math]::Round($agg.cost_credits, 2)
+            priced             = ($priceCheck -ne $null)
         }
     }
 
     $report.data = $costData
     $report.totals = [ordered]@{
-        input_tokens  = $grandInput
-        output_tokens = $grandOutput
-        cache_tokens  = $grandCache
-        cost_usd      = [math]::Round($grandUsd, 4)
-        cost_credits  = [math]::Round($grandCredits, 2)
+        input_tokens        = $grandInput
+        output_tokens       = $grandOutput
+        cache_tokens        = $grandCache
+        cache_write_tokens  = $grandCacheWrite
+        cost_usd            = [math]::Round($grandUsd, 4)
+        cost_credits        = [math]::Round($grandCredits, 2)
     }
 }
 else {
-    # Daily / Weekly / Monthly aggregation
-    $groupExpr = "date(start_time_ms / 1000, 'unixepoch')"
+    # Daily / Weekly / Monthly aggregation — per-span processing
     $groupLabel = "date"
-    if ($Weekly) {
-        $groupExpr = "strftime('%G-W%V', start_time_ms / 1000, 'unixepoch')"
-        $groupLabel = "week"
-    } elseif ($Monthly) {
-        $groupExpr = "strftime('%Y-%m', start_time_ms / 1000, 'unixepoch')"
-        $groupLabel = "month"
+    if ($Weekly) { $groupLabel = "week" }
+    elseif ($Monthly) { $groupLabel = "month" }
+
+    # Get individual invoke_agent spans
+    $sql = @"
+SELECT span_id, request_model, start_time_ms
+FROM spans s
+$filterClause
+  AND s.name LIKE 'invoke_agent%'
+ORDER BY start_time_ms
+"@
+    $agentSpans = Invoke-SqliteQuery -Sql $sql -Db $resolvedDbPath
+    if (-not $agentSpans) { $agentSpans = @() }
+
+    # Compute period string for a timestamp
+    function Get-Period {
+        param([long]$StartTimeMs)
+        $dt = [DateTimeOffset]::FromUnixTimeMilliseconds($StartTimeMs)
+        if ($Weekly) {
+            # ISO week: year + '-W' + week number
+            $cal = [System.Globalization.CultureInfo]::InvariantCulture.Calendar
+            $week = $cal.GetWeekOfYear($dt.DateTime, [System.Globalization.CalendarWeekRule]::FirstFourDayWeek, [System.DayOfWeek]::Monday)
+            # Adjust year for weeks that span Dec/Jan
+            if ($week -ge 52 -and $dt.Month -eq 1) { $year = $dt.Year - 1 }
+            elseif ($week -eq 1 -and $dt.Month -eq 12) { $year = $dt.Year + 1 }
+            else { $year = $dt.Year }
+            return "$year-W$($week.ToString('00'))"
+        }
+        elseif ($Monthly) {
+            return $dt.ToString('yyyy-MM')
+        }
+        else {
+            return $dt.ToString('yyyy-MM-dd')
+        }
     }
 
-    # Get sessions aggregated by period
-    $sql = "SELECT $groupExpr AS period, s.request_model, COUNT(*) AS session_count, SUM(COALESCE((SELECT value FROM span_attributes WHERE span_id = s.span_id AND key = 'gen_ai.usage.input_tokens'), '0')) AS total_input, SUM(COALESCE((SELECT value FROM span_attributes WHERE span_id = s.span_id AND key = 'gen_ai.usage.output_tokens'), '0')) AS total_output, SUM(COALESCE((SELECT value FROM span_attributes WHERE span_id = s.span_id AND key = 'gen_ai.usage.cache_read.input_tokens'), '0')) AS total_cache FROM spans s $filterClause AND s.name LIKE 'invoke_agent%' GROUP BY period, s.request_model"
-    if ($Period) {
-        $sql += " HAVING period = '$Period'"
-    }
-    $sql += " ORDER BY period, s.request_model"
-    $aggRows = Invoke-SqliteQuery -Sql $sql -Db $resolvedDbPath
-    if (-not $aggRows) { $aggRows = @() }
-
-    # Group by period
+    # Aggregate per-span costs by period, then by model
     $periods = [ordered]@{}
-    foreach ($r in $aggRows) {
-        $period = $r.period
+    foreach ($span in $agentSpans) {
+        $period = Get-Period -StartTimeMs ([long]$span.start_time_ms)
+
+        # Apply period filter if specified
+        if ($Period -and $period -ne $Period) { continue }
+
+        $sid = $span.span_id
+        $attrSql = "SELECT key, value FROM span_attributes WHERE span_id = '$sid' AND key IN ('gen_ai.usage.input_tokens', 'gen_ai.usage.output_tokens', 'gen_ai.usage.cache_read.input_tokens', 'gen_ai.usage.cache_creation.input_tokens')"
+        $attrs = Invoke-SqliteQuery -Sql $attrSql -Db $resolvedDbPath
+
+        $inputTokens = 0; $outputTokens = 0; $cacheTokens = 0; $cacheWriteTokens = 0
+        if ($attrs) {
+            foreach ($a in $attrs) {
+                switch ($a.key) {
+                    'gen_ai.usage.input_tokens'            { $inputTokens = [int]$a.value }
+                    'gen_ai.usage.output_tokens'           { $outputTokens = [int]$a.value }
+                    'gen_ai.usage.cache_read.input_tokens'  { $cacheTokens = [int]$a.value }
+                    'gen_ai.usage.cache_creation.input_tokens' { $cacheWriteTokens = [int]$a.value }
+                }
+            }
+        }
+
+        # Ensure period entry exists
         if (-not $periods.Contains($period)) {
-            $periods[$period] = @{
-                $groupLabel = $period
-                sessions    = 0
-                models      = @()
+            $periods[$period] = [ordered]@{
+                $groupLabel  = $period
+                sessions     = 0
                 total_input  = 0
                 total_output = 0
                 total_cache  = 0
+                total_cache_write = 0
+                cost_usd     = 0.0
+                cost_credits = 0.0
+                modelAgg     = @{}
+            }
+        }
+        $p = $periods[$period]
+        $p.sessions++
+        $p.total_input += $inputTokens
+        $p.total_output += $outputTokens
+        $p.total_cache += $cacheTokens
+        $p.total_cache_write += $cacheWriteTokens
+
+        # Aggregate by model within period
+        $modelKey = $span.request_model
+        if (-not $p.modelAgg.ContainsKey($modelKey)) {
+            $p.modelAgg[$modelKey] = @{
+                sessions     = 0
+                input        = 0
+                output       = 0
+                cache        = 0
+                cache_write  = 0
                 cost_usd     = 0.0
                 cost_credits = 0.0
             }
         }
-        $p = $periods[$period]
-        $p.sessions += [int]$r.session_count
-        $p.total_input += [int]$r.total_input
-        $p.total_output += [int]$r.total_output
-        $p.total_cache += [int]$r.total_cache
+        $ma = $p.modelAgg[$modelKey]
+        $ma.sessions++
+        $ma.input += $inputTokens
+        $ma.output += $outputTokens
+        $ma.cache += $cacheTokens
+        $ma.cache_write += $cacheWriteTokens
 
-        $priceInfo = Get-PriceInfo -OtelModelId $r.request_model
-        $c = Get-Cost -Pricing $priceInfo -InTokens $r.total_input -OutTokens $r.total_output -CacheTok $r.total_cache
-        if ($c) { $p.cost_usd += $c.usd; $p.cost_credits += $c.credits }
-
-        $p.models += [ordered]@{
-            model         = Format-ModelName -OtelId $r.request_model
-            model_raw     = $r.request_model
-            sessions      = [int]$r.session_count
-            input_tokens  = [int]$r.total_input
-            output_tokens = [int]$r.total_output
-            cache_tokens  = [int]$r.total_cache
-            cost_usd      = if ($c) { $c.usd } else { $null }
-            cost_credits  = if ($c) { $c.credits } else { $null }
-        }
+        $priceInfo = Get-PriceInfo -OtelModelId $span.request_model -InputTokens $inputTokens
+        $c = Get-Cost -Pricing $priceInfo -InTokens $inputTokens -OutTokens $outputTokens -CacheTok $cacheTokens -CacheWriteTok $cacheWriteTokens
+        if ($c) { $ma.cost_usd += $c.usd; $ma.cost_credits += $c.credits }
     }
 
-    foreach ($p in $periods.Values) {
+    # Build output from aggregated data
+    foreach ($period in $periods.Keys) {
+        $p = $periods[$period]
+        $p.cost_usd = 0.0; $p.cost_credits = 0.0
+        $p.models = @()
+
+        foreach ($modelKey in ($p.modelAgg.Keys | Sort-Object { $p.modelAgg[$_].input } -Descending)) {
+            $ma = $p.modelAgg[$modelKey]
+            $p.cost_usd += $ma.cost_usd
+            $p.cost_credits += $ma.cost_credits
+
+            $p.models += [ordered]@{
+                model              = Format-ModelName -OtelId $modelKey
+                model_raw          = $modelKey
+                sessions           = $ma.sessions
+                input_tokens       = $ma.input
+                output_tokens      = $ma.output
+                cache_tokens       = $ma.cache
+                cache_write_tokens = $ma.cache_write
+                cost_usd           = [math]::Round($ma.cost_usd, 4)
+                cost_credits       = [math]::Round($ma.cost_credits, 2)
+            }
+        }
+
         $p.cost_usd = [math]::Round($p.cost_usd, 4)
         $p.cost_credits = [math]::Round($p.cost_credits, 2)
+        $p.Remove('modelAgg')
     }
+
     $report.data = @($periods.Values)
 }
 
