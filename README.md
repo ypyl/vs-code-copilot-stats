@@ -75,10 +75,14 @@ Queries an exported `.db` file and produces JSON reports.
 # Save report to file
 .\copilot-stats.ps1 -DbPath agent-traces.db -Daily -OutputFile report.json
 
-# Limit results (applied at SQL level — most recent N records, top N by tokens for -Cost)
+# Limit results (applied at SQL level for single DB, post-merge for folder)
 .\copilot-stats.ps1 -DbPath agent-traces.db -Sessions -TopN 10
 .\copilot-stats.ps1 -DbPath agent-traces.db -Cost -TopN 5
 .\copilot-stats.ps1 -DbPath agent-traces.db -Prompts -TopN 3
+
+# Analyze a folder with multiple .db files (from different VS Code instances)
+.\copilot-stats.ps1 -DbPath "C:\Users\me\Copilot Traces" -Sessions
+.\copilot-stats.ps1 -DbPath "C:\Users\me\Copilot Traces" -Daily -TopN 7
 ```
 
 ## Example output
@@ -98,7 +102,10 @@ Queries an exported `.db` file and produces JSON reports.
       "duration_sec": 18.0,
       "turns": 2,
       "cost_usd": 0.015,
-      "cost_credits": 1.50
+      "cost_credits": 1.50,
+      "conversation_id": "abc123",
+      "conversation_title": "Debug auth flow",
+      "session_summary": "Debug auth flow"
     }
   ]
 }
@@ -118,6 +125,8 @@ Queries an exported `.db` file and produces JSON reports.
       "cache_write_tokens": 0,
       "cost_usd": 0.0044,
       "cost_credits": 0.44,
+      "conversation_id": "abc123",
+      "conversation_title": "Debug auth flow",
       "session_summary": "Debug auth flow",
       "content_available": true,
       "content_chars": 184320,
@@ -168,6 +177,7 @@ Queries an exported `.db` file and produces JSON reports.
 | Full LLM prompt content | `gen_ai.input.messages` attribute (content capture required) |
 | Models used | `gen_ai.request.model` |
 | Sessions per day/week/month | `invoke_agent` spans grouped by date |
+| Conversation title | `gen_ai.conversation.title` or first `copilot_chat.user_request` per conversation |
 | Turn count per session | `copilot_chat.turn_count` attribute |
 | Agent duration | `start_time_ms` → `end_time_ms` |
 | Tool calls | `execute_tool` spans |
