@@ -29,6 +29,9 @@ Track GitHub Copilot usage and costs from VS Code's built-in OpenTelemetry expor
 .\copilot-stats.ps1 -DbPath agent-traces.db -Daily
 .\copilot-stats.ps1 -DbPath agent-traces.db -Sessions
 .\copilot-stats.ps1 -DbPath agent-traces.db -Cost
+
+# Optional: enable full prompt capture to inspect LLM request content
+.\setup-content-capture.ps1
 ```
 
 ## Commands
@@ -65,8 +68,17 @@ Queries an exported `.db` file and produces JSON reports.
 # Cost breakdown by model
 .\copilot-stats.ps1 -DbPath agent-traces.db -Cost
 
+# Export full LLM prompt content (requires content capture enabled)
+.\copilot-stats.ps1 -DbPath agent-traces.db -Prompts
+.\copilot-stats.ps1 -DbPath agent-traces.db -Prompts -OutputFile prompts.json
+
 # Save report to file
 .\copilot-stats.ps1 -DbPath agent-traces.db -Daily -OutputFile report.json
+
+# Limit results (applied at SQL level — most recent N records, top N by tokens for -Cost)
+.\copilot-stats.ps1 -DbPath agent-traces.db -Sessions -TopN 10
+.\copilot-stats.ps1 -DbPath agent-traces.db -Cost -TopN 5
+.\copilot-stats.ps1 -DbPath agent-traces.db -Prompts -TopN 3
 ```
 
 ## Example output
@@ -89,6 +101,35 @@ Queries an exported `.db` file and produces JSON reports.
       "cost_credits": 1.50
     }
   ]
+}
+```
+
+### Prompts mode
+```json
+{
+  "report_type": "prompts",
+  "data": [
+    {
+      "date": "2026-06-06",
+      "model": "raptor-mini",
+      "input_tokens": 50550,
+      "output_tokens": 859,
+      "cache_tokens": 38000,
+      "cache_write_tokens": 0,
+      "cost_usd": 0.0044,
+      "cost_credits": 0.44,
+      "session_summary": "Debug auth flow",
+      "content_available": true,
+      "content_chars": 184320,
+      "prompt_content": "[full LLM prompt text — system messages, context, history, user request]"
+    }
+  ],
+  "summary": {
+    "total_sessions": 12,
+    "sessions_with_content": 8,
+    "sessions_without_content": 4,
+    "note": "Content capture must be enabled (setup-content-capture.ps1) for prompt_content to appear."
+  }
 }
 ```
 
@@ -124,6 +165,7 @@ Queries an exported `.db` file and produces JSON reports.
 | Metric | Source |
 |--------|--------|
 | Token usage (input/output/cache/cache_write) | `invoke_agent` and `chat` spans |
+| Full LLM prompt content | `gen_ai.input.messages` attribute (content capture required) |
 | Models used | `gen_ai.request.model` |
 | Sessions per day/week/month | `invoke_agent` spans grouped by date |
 | Turn count per session | `copilot_chat.turn_count` attribute |
@@ -191,7 +233,8 @@ When GitHub updates pricing, edit this file. To map a new OTel model ID to a pri
 ```
 copilot-stats/
 ├── README.md
-├── setup-otel.ps1           Enable OTel SQLite exporter in VS Code
-├── copilot-stats.ps1         Query exported DB, produce usage/cost reports
-└── model-pricing.json        Rate card for all GitHub Copilot models
+├── setup-otel.ps1              Enable OTel SQLite exporter in VS Code
+├── setup-content-capture.ps1   Toggle full prompt/response capture
+├── copilot-stats.ps1           Query exported DB, produce usage/cost reports
+└── model-pricing.json          Rate card for all GitHub Copilot models
 ```

@@ -26,8 +26,16 @@
 .PARAMETER Cost
     Output cost breakdown by model with pricing tier applied.
 
+.PARAMETER Prompts
+    Export full LLM prompt content (gen_ai.input.messages) per session.
+    Requires content capture to be enabled (see setup-content-capture.ps1).
+
 .PARAMETER OutputFile
     Optional path to save the JSON report.
+
+.PARAMETER TopN
+    Limit output to the top N records (most recent for time-based modes,
+    highest cost for -Cost mode). 0 or omitted = all records.
 
 .PARAMETER Period
     Filter results to a specific period matching the mode format:
@@ -53,6 +61,14 @@
 
 .EXAMPLE
     .\copilot-stats.ps1 -DbPath agent-traces.db -Cost
+
+.EXAMPLE
+    .\copilot-stats.ps1 -DbPath agent-traces.db -Prompts
+    Export full prompt content for each session.
+
+.EXAMPLE
+    .\copilot-stats.ps1 -DbPath agent-traces.db -Prompts -OutputFile prompts.json
+    Save prompt content to a file.
 #>
 
 param(
@@ -64,10 +80,13 @@ param(
     [switch]$Weekly,
     [switch]$Monthly,
     [switch]$Cost,
+    [switch]$Prompts,
 
     [string]$OutputFile,
 
-    [string]$Period
+    [string]$Period,
+
+    [int]$TopN = 0
 )
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -75,7 +94,7 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 # ============================================================
 # Default mode: Daily if nothing specified
 # ============================================================
-if (-not ($Sessions -or $Daily -or $Weekly -or $Monthly -or $Cost)) {
+if (-not ($Sessions -or $Daily -or $Weekly -or $Monthly -or $Cost -or $Prompts)) {
     $Daily = $true
 }
 
@@ -314,6 +333,7 @@ if ($Sessions) { $modeName = "sessions" }
 if ($Weekly)   { $modeName = "weekly" }
 if ($Monthly)  { $modeName = "monthly" }
 if ($Cost)     { $modeName = "cost" }
+if ($Prompts)  { $modeName = "prompts" }
 
 # ============================================================
 # Generate report
@@ -342,8 +362,9 @@ SELECT
 FROM spans s
 $filterClause
   AND s.name LIKE 'invoke_agent%'
-ORDER BY s.start_time_ms
+ORDER BY s.start_time_ms DESC
 "@
+    if ($TopN -gt 0) { $sql += " LIMIT $TopN" }
     $agentSpans = Invoke-SqliteQuery -Sql $sql -Db $resolvedDbPath
     if (-not $agentSpans) { $agentSpans = @() }
 
@@ -414,7 +435,9 @@ SELECT span_id, request_model
 FROM spans
 $filterClause
   AND name LIKE 'chat%'
+ORDER BY input_tokens DESC
 "@
+    if ($TopN -gt 0) { $sql += " LIMIT $TopN" }
     $chatSpans = Invoke-SqliteQuery -Sql $sql -Db $resolvedDbPath
     if (-not $chatSpans) { $chatSpans = @() }
 
@@ -500,6 +523,103 @@ $filterClause
         cost_credits        = [math]::Round($grandCredits, 2)
     }
 }
+elseif ($Prompts) {
+    # Export full LLM prompt content per session
+    $sql = @"
+SELECT
+    s.span_id,
+    s.request_model,
+    s.start_time_ms,
+    COALESCE(
+        (SELECT value FROM span_attributes WHERE span_id = s.span_id AND key = 'copilot_chat.turn_count'),
+        '0'
+    ) AS turn_count
+FROM spans s
+$filterClause
+  AND s.name LIKE 'invoke_agent%'
+ORDER BY s.start_time_ms DESC
+"@
+    if ($TopN -gt 0) { $sql += " LIMIT $TopN" }
+    $agentSpans = Invoke-SqliteQuery -Sql $sql -Db $resolvedDbPath
+    if (-not $agentSpans) { $agentSpans = @() }
+
+    $promptData = @()
+    foreach ($span in $agentSpans) {
+        $sid = $span.span_id
+        $attrSql = "SELECT key, value FROM span_attributes WHERE span_id = '$sid' AND key IN ('gen_ai.usage.input_tokens', 'gen_ai.usage.output_tokens', 'gen_ai.usage.cache_read.input_tokens', 'gen_ai.usage.cache_creation.input_tokens', 'gen_ai.input.messages', 'copilot_chat.user_request')"
+        $attrs = Invoke-SqliteQuery -Sql $attrSql -Db $resolvedDbPath
+
+        $inputTokens = 0; $outputTokens = 0; $cacheTokens = 0; $cacheWriteTokens = 0
+        $promptContent = $null; $userRequest = ""
+        if ($attrs) {
+            foreach ($a in $attrs) {
+                switch ($a.key) {
+                    'gen_ai.usage.input_tokens'             { $inputTokens = [int]$a.value }
+                    'gen_ai.usage.output_tokens'            { $outputTokens = [int]$a.value }
+                    'gen_ai.usage.cache_read.input_tokens'  { $cacheTokens = [int]$a.value }
+                    'gen_ai.usage.cache_creation.input_tokens' { $cacheWriteTokens = [int]$a.value }
+                    'gen_ai.input.messages'                 { $promptContent = $a.value }
+                    'copilot_chat.user_request'             { $userRequest = $a.value }
+                }
+            }
+        }
+
+        # Build session summary from first line of user request
+        $summary = "(no summary)"
+        if ($userRequest) {
+            $firstLine = ($userRequest -split '\n')[0].Trim()
+            if ($firstLine.Length -gt 0) {
+                if ($firstLine.Length -gt 120) {
+                    $summary = $firstLine.Substring(0, 120) + "..."
+                } else {
+                    $summary = $firstLine
+                }
+            }
+        }
+
+        $modelName = Format-ModelName -OtelId $span.request_model
+        $priceInfo = Get-PriceInfo -OtelModelId $span.request_model -InputTokens $inputTokens
+        $c = Get-Cost -Pricing $priceInfo -InTokens $inputTokens -OutTokens $outputTokens -CacheTok $cacheTokens -CacheWriteTok $cacheWriteTokens
+
+        $ts = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$span.start_time_ms)
+        $contentAvailable = ($null -ne $promptContent -and $promptContent.Length -gt 0)
+        $contentSize = if ($promptContent) { $promptContent.Length } else { 0 }
+
+        $entry = [ordered]@{
+            timestamp          = $ts.ToString('o')
+            date               = $ts.ToString('yyyy-MM-dd')
+            model              = $modelName
+            model_raw          = $span.request_model
+            turns              = [int]$span.turn_count
+            input_tokens       = $inputTokens
+            output_tokens      = $outputTokens
+            cache_tokens       = $cacheTokens
+            cache_write_tokens = $cacheWriteTokens
+            cost_usd           = if ($c) { $c.usd } else { $null }
+            cost_credits       = if ($c) { $c.credits } else { $null }
+            session_summary    = $summary
+            content_available  = $contentAvailable
+            content_chars      = $contentSize
+        }
+
+        if ($contentAvailable) {
+            $entry.prompt_content = $promptContent
+        }
+
+        $promptData += $entry
+    }
+
+    $report.data = $promptData
+    # Add summary stats
+    $totalSessions = $promptData.Count
+    $sessionsWithContent = ($promptData | Where-Object { $_.content_available }).Count
+    $report.summary = [ordered]@{
+        total_sessions         = $totalSessions
+        sessions_with_content  = $sessionsWithContent
+        sessions_without_content = $totalSessions - $sessionsWithContent
+        note                   = "Content capture must be enabled (setup-content-capture.ps1) for prompt_content to appear."
+    }
+}
 else {
     # Daily / Weekly / Monthly aggregation — per-span processing
     $groupLabel = "date"
@@ -512,8 +632,9 @@ SELECT span_id, request_model, start_time_ms
 FROM spans s
 $filterClause
   AND s.name LIKE 'invoke_agent%'
-ORDER BY start_time_ms
+ORDER BY start_time_ms DESC
 "@
+    if ($TopN -gt 0) { $sql += " LIMIT $TopN" }
     $agentSpans = Invoke-SqliteQuery -Sql $sql -Db $resolvedDbPath
     if (-not $agentSpans) { $agentSpans = @() }
 
